@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -823,6 +824,185 @@ func TestLoggingTransportServerBatchRejection(t *testing.T) {
 			send(`[{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"ping"}]`)
 			if line, ok := recv(); ok {
 				t.Errorf("server answered a JSON-RPC batch on a 2025-11-25 session: %q", line)
+			}
+		})
+	}
+}
+
+type opaqueConnTransport struct {
+	Transport
+}
+
+func (w opaqueConnTransport) Connect(ctx context.Context) (Connection, error) {
+	c, err := w.Transport.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Hide all unexported interfaces (serverConnection, jsonrpc2.ResponseDropper)
+	// just like an external user-defined Connection wrapper.
+	return struct{ Connection }{c}, nil
+}
+
+// TestWrappedIOTransportServerProtocolVersion verifies that an external
+// Connection wrapper around a stdio-style transport does not prevent ioConn
+// from learning the negotiated protocol version or enforcing version-gated
+// behaviors (rejecting JSON-RPC batches on >= 2025-06-18 and dropping
+// responses to cancelled calls on >= 2026-07-28). See #1516.
+func TestWrappedIOTransportServerProtocolVersion(t *testing.T) {
+	t.Run("batch_rejected_on_2025-11-25", func(t *testing.T) {
+		ctx := context.Background()
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		tr := opaqueConnTransport{&IOTransport{Reader: inR, Writer: outW}}
+
+		s := NewServer(testImpl, nil)
+		ss, err := s.Connect(ctx, tr, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ss.Close()
+
+		lines := bufio.NewScanner(outR)
+		send := func(msg string) {
+			t.Helper()
+			if _, err := io.WriteString(inW, msg+"\n"); err != nil {
+				t.Fatalf("write %q: %v", msg, err)
+			}
+		}
+		recv := func() (string, bool) {
+			ch := make(chan string, 1)
+			go func() {
+				if lines.Scan() {
+					ch <- lines.Text()
+				}
+				close(ch)
+			}()
+			select {
+			case line, ok := <-ch:
+				return line, ok
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for the server to respond")
+				return "", false
+			}
+		}
+
+		send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`)
+		if line, ok := recv(); !ok || !strings.Contains(line, `"protocolVersion":"2025-11-25"`) {
+			t.Fatalf("initialize: got %q, want a 2025-11-25 InitializeResult", line)
+		}
+		send(`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+		send(`[{"jsonrpc":"2.0","id":2,"method":"ping"}]`)
+		if line, ok := recv(); ok {
+			t.Errorf("wrapped server answered a JSON-RPC batch on a 2025-11-25 session: %q", line)
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		version  string
+		wantDrop bool
+	}{
+		{"cancelled_dropped_on_2026-07-28", protocolVersion20260728, true},
+		{"cancelled_answered_on_2025-11-25", protocolVersion20251125, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			inR, inW := io.Pipe()
+			outR, outW := io.Pipe()
+			tr := opaqueConnTransport{&IOTransport{Reader: inR, Writer: outW}}
+
+			started := make(chan struct{})
+			s := NewServer(testImpl, nil)
+			s.AddTool(&Tool{Name: "slow", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *CallToolRequest) (*CallToolResult, error) {
+				close(started)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+			ss, err := s.Connect(ctx, tr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ss.Close()
+
+			lines := bufio.NewScanner(outR)
+			send := func(msg string) {
+				t.Helper()
+				if _, err := io.WriteString(inW, msg+"\n"); err != nil {
+					t.Fatalf("write %q: %v", msg, err)
+				}
+			}
+			recv := func() (string, bool) {
+				ch := make(chan string, 1)
+				go func() {
+					if lines.Scan() {
+						ch <- lines.Text()
+					}
+					close(ch)
+				}()
+				select {
+				case line, ok := <-ch:
+					return line, ok
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the server to respond")
+					return "", false
+				}
+			}
+
+			if tc.version >= protocolVersion20260728 {
+				discoverParams, _ := json.Marshal(newProtocolParams(nil))
+				send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":%s}`, discoverParams))
+				if line, ok := recv(); !ok || !strings.Contains(line, tc.version) {
+					t.Fatalf("server/discover: got %q, want %s DiscoverResult", line, tc.version)
+				}
+				callParams, _ := json.Marshal(newProtocolParams(map[string]any{"name": "slow", "arguments": map[string]any{}}))
+				send(fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":%s}`, callParams))
+			} else {
+				send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":%q,"capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`, tc.version))
+				if line, ok := recv(); !ok || !strings.Contains(line, fmt.Sprintf(`"protocolVersion":%q`, tc.version)) {
+					t.Fatalf("initialize: got %q, want %s InitializeResult", line, tc.version)
+				}
+				send(`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+				send(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}`)
+			}
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for slow tool to start")
+			}
+			send(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"stop"}}`)
+			// Send a follow-up ping so we can observe whether id:2 produced a response before id:3.
+			send(`{"jsonrpc":"2.0","id":3,"method":"ping"}`)
+
+			var gotIDs []any
+			for {
+				line, ok := recv()
+				if !ok {
+					t.Fatalf("connection closed before ping response; got IDs %v", gotIDs)
+				}
+				msg, err := jsonrpc2.DecodeMessage([]byte(line))
+				if err != nil {
+					t.Fatalf("decode %q: %v", line, err)
+				}
+				resp, ok := msg.(*jsonrpc.Response)
+				if !ok {
+					continue
+				}
+				gotIDs = append(gotIDs, resp.ID.Raw())
+				if resp.ID.Raw() == int64(3) {
+					break
+				}
+			}
+			sawCancelled := false
+			for _, id := range gotIDs {
+				if id == int64(2) {
+					sawCancelled = true
+				}
+			}
+			if tc.wantDrop && sawCancelled {
+				t.Errorf("cancelled request 2 was answered on %s; got response IDs %v", tc.version, gotIDs)
+			}
+			if !tc.wantDrop && !sawCancelled {
+				t.Errorf("cancelled request 2 was dropped on %s; got response IDs %v", tc.version, gotIDs)
 			}
 		})
 	}

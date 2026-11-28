@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -543,9 +544,18 @@ type ioConn struct {
 	//
 	// dropped holds the incoming calls the peer cancelled, whose responses
 	// Write discards (see [ioConn.DropResponse]). It is guarded by sessionMu too.
+	//
+	// initReqID/hasInitReqID and inFlight allow ioConn to learn the negotiated
+	// protocol version and drop cancelled responses even when wrapped by an
+	// external Connection decorator that does not forward unexported interfaces.
 	sessionMu       sync.Mutex
 	protocolVersion string
 	dropped         map[jsonrpc2.ID]bool // lazily allocated
+	initReqID       jsonrpc2.ID
+	hasInitReqID    bool
+	discoverReqID   jsonrpc2.ID
+	discoverVersion string
+	inFlight        map[jsonrpc2.ID]bool // lazily allocated
 
 	// writeMu is a 1-element semaphore guarding Write, which must be
 	// concurrency safe. Send to it to lock and receive from it to unlock.
@@ -743,6 +753,116 @@ func (t *ioConn) takeDropped(id jsonrpc.ID) bool {
 	return dropped
 }
 
+// observeIncoming records server-side protocol state from incoming JSON-RPC
+// messages so that ioConn enforces negotiated protocol rules (batch rejection
+// and cancellation response dropping) even when wrapped by a user Connection
+// that cannot implement unexported interfaces.
+func (t *ioConn) observeIncoming(msg jsonrpc.Message) {
+	req, ok := msg.(*jsonrpc.Request)
+	if !ok {
+		return
+	}
+	if req.IsCall() {
+		var metaVersion string
+		if req.Method != methodInitialize && len(req.Params) > 0 {
+			var p struct {
+				Meta map[string]any `json:"_meta"`
+			}
+			if err := json.Unmarshal(req.Params, &p); err == nil {
+				if v, ok := p.Meta[MetaKeyProtocolVersion].(string); ok {
+					metaVersion = v
+				}
+			}
+		}
+		t.sessionMu.Lock()
+		if t.inFlight == nil {
+			t.inFlight = make(map[jsonrpc2.ID]bool)
+		}
+		t.inFlight[req.ID] = true
+		if t.protocolVersion == "" {
+			switch {
+			case req.Method == methodInitialize:
+				t.initReqID = req.ID
+				t.hasInitReqID = true
+			case req.Method == methodDiscover && metaVersion >= protocolVersion20260728:
+				t.discoverReqID = req.ID
+				t.discoverVersion = metaVersion
+			case metaVersion >= protocolVersion20260728:
+				t.protocolVersion = metaVersion
+			}
+		}
+		t.sessionMu.Unlock()
+		return
+	}
+	if req.Method == notificationCancelled {
+		var params CancelledParams
+		if err := internaljson.UnmarshalUseNumber(req.Params, &params); err != nil {
+			return
+		}
+		id, err := jsonrpc2.MakeID(params.RequestID)
+		if err != nil {
+			return
+		}
+		t.sessionMu.Lock()
+		if t.protocolVersion >= protocolVersion20260728 && t.inFlight[id] {
+			if t.dropped == nil {
+				t.dropped = make(map[jsonrpc2.ID]bool)
+			}
+			t.dropped[id] = true
+		}
+		t.sessionMu.Unlock()
+	}
+}
+
+// observeOutgoingResponse updates protocol state from an outgoing JSON-RPC
+// response, clearing in-flight tracking and learning the negotiated protocol
+// version from the initialize or server/discover response if
+// serverSessionUpdated was not called.
+func (t *ioConn) observeOutgoingResponse(resp *jsonrpc.Response) {
+	t.sessionMu.Lock()
+	delete(t.inFlight, resp.ID)
+	isInit := t.hasInitReqID && resp.ID == t.initReqID
+	if isInit {
+		t.hasInitReqID = false
+	}
+	var discoverVersion string
+	if t.discoverVersion != "" && resp.ID == t.discoverReqID {
+		discoverVersion = t.discoverVersion
+		t.discoverVersion = ""
+	}
+	needVersion := (isInit || discoverVersion != "") && t.protocolVersion == ""
+	t.sessionMu.Unlock()
+
+	if !needVersion || resp.Error != nil || len(resp.Result) == 0 {
+		return
+	}
+	if isInit {
+		var res struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if err := json.Unmarshal(resp.Result, &res); err == nil && res.ProtocolVersion != "" {
+			t.sessionMu.Lock()
+			if t.protocolVersion == "" {
+				t.protocolVersion = res.ProtocolVersion
+			}
+			t.sessionMu.Unlock()
+		}
+		return
+	}
+	if discoverVersion != "" {
+		var res struct {
+			SupportedVersions []string `json:"supportedVersions"`
+		}
+		if err := json.Unmarshal(resp.Result, &res); err == nil && slices.Contains(res.SupportedVersions, discoverVersion) {
+			t.sessionMu.Lock()
+			if t.protocolVersion == "" {
+				t.protocolVersion = discoverVersion
+			}
+			t.sessionMu.Unlock()
+		}
+	}
+}
+
 // updateBatch records a response in the message batch tracking the
 // corresponding incoming call, if any.
 //
@@ -798,6 +918,7 @@ func (t *ioConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 	if len(t.queue) > 0 {
 		next := t.queue[0]
 		t.queue = t.queue[1:]
+		t.observeIncoming(next)
 		return next, nil
 	}
 
@@ -853,6 +974,9 @@ func (t *ioConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 			}
 		}
 	}
+	if err == nil {
+		t.observeIncoming(msgs[0])
+	}
 	return msgs[0], err
 }
 
@@ -899,6 +1023,7 @@ func (t *ioConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 	// want to collect it into a batch before sending, if we're configured to use
 	// outgoing batches.
 	if resp, ok := msg.(*jsonrpc.Response); ok {
+		t.observeOutgoingResponse(resp)
 		if t.takeDropped(resp.ID) {
 			return nil
 		}
